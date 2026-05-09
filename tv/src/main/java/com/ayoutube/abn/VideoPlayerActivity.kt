@@ -34,6 +34,7 @@ import androidx.compose.material.icons.filled.ThumbUp
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -73,12 +74,13 @@ class VideoPlayerActivity : ComponentActivity() {
 
     var player: ExoPlayer? = null
 
+    // Use explicit state holders — safer across Android versions
     val showControls = mutableStateOf(true)
     val isPlaying = mutableStateOf(false)
     val isLoading = mutableStateOf(true)
     val hasError = mutableStateOf(false)
-    val position = mutableStateOf(0L)
-    val duration = mutableStateOf(1L)
+    val position = mutableLongStateOf(0L)
+    val duration = mutableLongStateOf(1L)
 
     private val hideHandler = Handler(Looper.getMainLooper())
     private val hideRunnable = Runnable {
@@ -104,7 +106,10 @@ class VideoPlayerActivity : ComponentActivity() {
         val videoUrl = intent.getStringExtra(EXTRA_URL) ?: ""
         val videoTitle = intent.getStringExtra(EXTRA_TITLE) ?: ""
 
-        player = ExoPlayer.Builder(this).build()
+        // Build ExoPlayer with explicit Looper for Android 9 compatibility
+        player = ExoPlayer.Builder(this)
+            .setLooper(Looper.getMainLooper())
+            .build()
 
         player?.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
@@ -138,19 +143,16 @@ class VideoPlayerActivity : ComponentActivity() {
                 try {
                     val info = StreamInfo.getInfo(ServiceList.YouTube, videoUrl)
 
-                    // Try muxed (video+audio combined) streams first
                     val muxedStream = info.videoStreams
                         .filter { it.content.isNotEmpty() }
                         .maxByOrNull { it.height }
 
-                    // Try video-only streams as fallback
                     val videoOnlyStream = if (muxedStream == null) {
                         info.videoOnlyStreams
                             .filter { it.content.isNotEmpty() }
                             .maxByOrNull { it.height }
                     } else null
 
-                    // Get best audio stream
                     val audioStream = info.audioStreams
                         .filter { it.content.isNotEmpty() }
                         .maxByOrNull { it.averageBitrate }
@@ -158,8 +160,12 @@ class VideoPlayerActivity : ComponentActivity() {
                     withContext(Dispatchers.Main) {
                         val videoStreamUrl = muxedStream?.content ?: videoOnlyStream?.content
                         if (videoStreamUrl != null && audioStream != null && muxedStream == null) {
-                            // Video-only + separate audio → merge both sources
+                            // Build HTTP factory with increased timeouts for Android 9
                             val httpFactory = DefaultHttpDataSource.Factory()
+                                .setConnectTimeoutMs(30000)
+                                .setReadTimeoutMs(30000)
+                                .setAllowCrossProtocolRedirects(true)
+
                             val videoSource = ProgressiveMediaSource.Factory(httpFactory)
                                 .createMediaSource(MediaItem.fromUri(videoStreamUrl))
                             val audioSource = ProgressiveMediaSource.Factory(httpFactory)
@@ -167,10 +173,8 @@ class VideoPlayerActivity : ComponentActivity() {
                             val mergedSource = MergingMediaSource(videoSource, audioSource)
                             player?.setMediaSource(mergedSource)
                         } else if (videoStreamUrl != null) {
-                            // Muxed stream has both audio and video
                             player?.setMediaItem(MediaItem.fromUri(videoStreamUrl))
                         } else if (audioStream != null) {
-                            // Audio-only fallback
                             player?.setMediaItem(MediaItem.fromUri(audioStream.content))
                         } else {
                             hasError.value = true
@@ -215,8 +219,8 @@ class VideoPlayerActivity : ComponentActivity() {
 
     fun updateProgress() {
         player?.let { p ->
-            position.value = p.currentPosition
-            duration.value = p.duration.coerceAtLeast(1L)
+            position.longValue = p.currentPosition
+            duration.longValue = p.duration.coerceAtLeast(1L)
         }
     }
 
@@ -309,7 +313,6 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
             modifier = Modifier.fillMaxSize()
         )
 
-        // Loading state
         if (isLoading) {
             Box(
                 modifier = Modifier.fillMaxSize(),
@@ -331,7 +334,6 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
             }
         }
 
-        // Error state
         if (hasError) {
             Box(
                 modifier = Modifier.fillMaxSize(),
@@ -353,9 +355,7 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
             }
         }
 
-        // Controls overlay
         if (showControls && !isLoading && !hasError) {
-            // Focus on controls when they appear
             LaunchedEffect(Unit) {
                 try {
                     focusRequester.requestFocus()
@@ -364,7 +364,6 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
                 }
             }
 
-            // Gradient overlays for control visibility
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -379,7 +378,6 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
                     )
             )
 
-            // Top Bar - Title
             Column(
                 modifier = Modifier
                     .align(Alignment.TopStart)
@@ -393,7 +391,6 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
                 )
             }
 
-            // Center Play/Pause button - Solid white when selected
             Box(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
@@ -422,14 +419,12 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
                 }
             }
 
-            // Bottom controls
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .align(Alignment.BottomCenter)
                     .padding(horizontal = 48.dp, vertical = 32.dp)
             ) {
-                // Seekbar Line
                 val progress = if (duration > 0L) (position.toFloat() / duration.toFloat()) else 0f
                 Box(
                     modifier = Modifier
@@ -447,7 +442,6 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // Time labels below seekbar (Left and Right sides)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween
@@ -466,15 +460,12 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
 
                 Spacer(modifier = Modifier.height(24.dp))
 
-                // Action buttons row (Avatar, Chips, Icon Capsule Groups)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Left side actions
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        // Channel Avatar - Selected state turns white
                         Surface(
                             shape = ClickableSurfaceDefaults.shape(CircleShape),
                             scale = ClickableSurfaceDefaults.scale(focusedScale = 1f),
@@ -488,20 +479,18 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
                             onClick = {}
                         ) {
                             Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                                Text("🌻", style = MaterialTheme.typography.headlineSmall)
+                                Text("\uD83C\uDF3B", style = MaterialTheme.typography.headlineSmall)
                             }
                         }
-                        
+
                         Spacer(modifier = Modifier.width(16.dp))
-                        
+
                         ControlChip(text = "Description")
                         Spacer(modifier = Modifier.width(12.dp))
                         ControlChip(text = "Subscribe")
                     }
 
-                    // Right side icons - Each icon is a selector
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        // Capsule group for main actions
                         Box(
                             modifier = Modifier
                                 .background(Color.White.copy(alpha = 0.12f), CircleShape)
@@ -514,10 +503,9 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
                                 ControlIconButton(Icons.Default.Bookmark, "Save")
                             }
                         }
-                        
+
                         Spacer(modifier = Modifier.width(12.dp))
-                        
-                        // Capsule group for player settings
+
                         Box(
                             modifier = Modifier
                                 .background(Color.White.copy(alpha = 0.12f), CircleShape)
