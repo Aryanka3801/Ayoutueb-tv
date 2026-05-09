@@ -59,12 +59,12 @@ class VideoPlayerActivity : ComponentActivity() {
     val position = mutableLongStateOf(0L)
     val duration = mutableLongStateOf(1L)
 
-    // Fix #5: detect Android 9 for codec-safe stream selection
+    // Fix #5: Android 9 (API 28) has limited VP9/Opus codec support
     private val isAndroid9OrBelow = Build.VERSION.SDK_INT <= Build.VERSION_CODES.P
 
     private val hideHandler = Handler(Looper.getMainLooper())
 
-    // Fix #9: guard against post-destroy state mutation from the auto-hide runnable
+    // Fix #9: never mutate Compose state from handler after Activity is destroyed
     private val hideRunnable = Runnable {
         if (!isDestroyed && lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
             showControls.value = false
@@ -76,8 +76,7 @@ class VideoPlayerActivity : ComponentActivity() {
         const val EXTRA_TITLE = "VIDEO_TITLE"
         fun launch(context: Context, url: String, title: String) {
             context.startActivity(Intent(context, VideoPlayerActivity::class.java).apply {
-                putExtra(EXTRA_URL, url)
-                putExtra(EXTRA_TITLE, title)
+                putExtra(EXTRA_URL, url); putExtra(EXTRA_TITLE, title)
             })
         }
     }
@@ -90,11 +89,11 @@ class VideoPlayerActivity : ComponentActivity() {
 
         player = ExoPlayer.Builder(this).setLooper(Looper.getMainLooper()).build()
         player?.addListener(object : Player.Listener {
-            // Fix #7: only mutate state while Activity is alive
+            // Fix #7: guard all state mutations with isDestroyed check
             override fun onIsPlayingChanged(playing: Boolean) {
                 if (!isDestroyed) isPlaying.value = playing
             }
-            // Fix #8: catch ExoPlayer errors gracefully — avoids crash on Android 9
+            // Fix #8: surface ExoPlayer errors as UI state instead of crashing
             override fun onPlayerError(error: PlaybackException) {
                 error.printStackTrace()
                 if (!isDestroyed) { hasError.value = true; isLoading.value = false }
@@ -122,7 +121,7 @@ class VideoPlayerActivity : ComponentActivity() {
 
     private fun loadVideo(videoUrl: String) {
         lifecycleScope.launch {
-            // Fix #8: bail early if already destroyed (back pressed before launch)
+            // Fix #8: bail immediately if Activity is already gone before IO starts
             if (isDestroyed) return@launch
             isLoading.value = true
             hasError.value = false
@@ -131,8 +130,8 @@ class VideoPlayerActivity : ComponentActivity() {
                 try {
                     val info = StreamInfo.getInfo(ServiceList.YouTube, videoUrl)
 
-                    // Fix #5: On Android 9 cap at 720p to stay within H.264/AAC codec
-                    // support and avoid VP9+Opus MergingMediaSource failures
+                    // Fix #5: on Android 9 cap streams at 720p to stay within
+                    // H.264/AAC codec support and avoid VP9+Opus MergingMediaSource crash
                     val muxedStream = info.videoStreams
                         .filter { it.content.isNotEmpty() }
                         .let { list ->
@@ -142,23 +141,22 @@ class VideoPlayerActivity : ComponentActivity() {
                             else list.maxByOrNull { it.height }
                         }
 
-                    val videoOnlyStream = if (muxedStream == null) {
-                        info.videoOnlyStreams
-                            .filter { it.content.isNotEmpty() }
+                    val videoOnlyStream = if (muxedStream == null)
+                        info.videoOnlyStreams.filter { it.content.isNotEmpty() }
                             .let { list ->
                                 if (isAndroid9OrBelow)
                                     list.filter { it.height <= 720 }.maxByOrNull { it.height }
                                         ?: list.minByOrNull { it.height }
                                 else list.maxByOrNull { it.height }
                             }
-                    } else null
+                    else null
 
                     val audioStream = info.audioStreams
                         .filter { it.content.isNotEmpty() }
                         .maxByOrNull { it.averageBitrate }
 
                     withContext(Dispatchers.Main) {
-                        // Fix #8: double-check — IO took time, Activity may be gone now
+                        // Fix #8: IO finished but Activity may have been destroyed meanwhile
                         if (isDestroyed || player == null) return@withContext
 
                         val httpFactory = DefaultHttpDataSource.Factory()
@@ -169,20 +167,18 @@ class VideoPlayerActivity : ComponentActivity() {
                                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
                             ))
 
-                        // Fix #5: explicit extractors factory avoids codec detection
-                        // failures on Android 9's stricter media pipeline
+                        // Fix #5: explicit extractor factory avoids Android 9 codec detection failures
                         val ef = DefaultExtractorsFactory()
-                        val videoUrl2 = muxedStream?.content ?: videoOnlyStream?.content
-
+                        val vUrl = muxedStream?.content ?: videoOnlyStream?.content
                         when {
-                            videoUrl2 != null && audioStream != null && muxedStream == null -> {
+                            vUrl != null && audioStream != null && muxedStream == null -> {
                                 val vs = ProgressiveMediaSource.Factory(httpFactory, ef)
-                                    .createMediaSource(MediaItem.fromUri(videoUrl2))
+                                    .createMediaSource(MediaItem.fromUri(vUrl))
                                 val aus = ProgressiveMediaSource.Factory(httpFactory, ef)
                                     .createMediaSource(MediaItem.fromUri(audioStream.content))
                                 player?.setMediaSource(MergingMediaSource(vs, aus))
                             }
-                            videoUrl2 != null -> player?.setMediaItem(MediaItem.fromUri(videoUrl2))
+                            vUrl != null -> player?.setMediaItem(MediaItem.fromUri(vUrl))
                             audioStream != null -> player?.setMediaItem(MediaItem.fromUri(audioStream.content))
                             else -> { hasError.value = true; isLoading.value = false; return@withContext }
                         }
@@ -232,8 +228,7 @@ class VideoPlayerActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // Fix #9: remove pending callbacks before releasing player
-        hideHandler.removeCallbacks(hideRunnable)
+        hideHandler.removeCallbacks(hideRunnable) // Fix #9: cancel pending callbacks first
         player?.release()
         player = null
     }
@@ -265,31 +260,26 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
             update = { it.player = activity.player },
             modifier = Modifier.fillMaxSize()
         )
-        if (isLoading) {
-            Box(Modifier.fillMaxSize(), Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Loading video...", color = Color.White, style = MaterialTheme.typography.headlineMedium)
-                    Spacer(Modifier.height(8.dp))
-                    Text(title, color = Color.Gray, style = MaterialTheme.typography.bodyMedium)
-                }
+        if (isLoading) Box(Modifier.fillMaxSize(), Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Loading video...", color = Color.White, style = MaterialTheme.typography.headlineMedium)
+                Spacer(Modifier.height(8.dp))
+                Text(title, color = Color.Gray, style = MaterialTheme.typography.bodyMedium)
             }
         }
-        if (hasError) {
-            Box(Modifier.fillMaxSize(), Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Could not load video", color = Color.Red, style = MaterialTheme.typography.headlineMedium)
-                    Spacer(Modifier.height(8.dp))
-                    Text("Press BACK to return", color = Color.Gray, style = MaterialTheme.typography.bodyMedium)
-                }
+        if (hasError) Box(Modifier.fillMaxSize(), Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Could not load video", color = Color.Red, style = MaterialTheme.typography.headlineMedium)
+                Spacer(Modifier.height(8.dp))
+                Text("Press BACK to return", color = Color.Gray, style = MaterialTheme.typography.bodyMedium)
             }
         }
         if (showControls && !isLoading && !hasError) {
             // Fix #12: try/catch around requestFocus — Android 9 TV Material can throw
-            // NullPointerException if ViewTreeLifecycleOwner isn't attached yet
-            LaunchedEffect(Unit) { try { focusRequester.requestFocus() } catch (_: Exception) { } }
-
+            // NullPointerException if ViewTreeLifecycleOwner is not yet attached
+            LaunchedEffect(Unit) { try { focusRequester.requestFocus() } catch (_: Exception) {} }
             Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Black.copy(.5f), Color.Transparent, Color.Black.copy(.5f)))))
-            Column(Modifier.align(Alignment.TopStart).padding(horizontal = 48.dp, vertical = 32.dp)) {
+            Column(Modifier.align(Alignment.TopStart).padding(48.dp, 32.dp)) {
                 Text(title, color = Color.White, style = MaterialTheme.typography.headlineMedium, modifier = Modifier.fillMaxWidth(.9f))
             }
             Box(Modifier.fillMaxSize(), Alignment.Center) {
@@ -305,7 +295,7 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
                     }
                 }
             }
-            Column(Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(horizontal = 48.dp, vertical = 32.dp)) {
+            Column(Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(48.dp, 32.dp)) {
                 val progress = if (duration > 0L) position.toFloat() / duration.toFloat() else 0f
                 Box(Modifier.fillMaxWidth().height(2.5.dp).background(Color.White.copy(.3f))) {
                     Box(Modifier.fillMaxWidth(progress).fillMaxHeight().background(Color.White))
@@ -327,7 +317,7 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
                         ControlChip("Description"); Spacer(Modifier.width(12.dp)); ControlChip("Subscribe")
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.background(Color.White.copy(.12f), CircleShape).padding(horizontal = 4.dp, vertical = 2.dp)) {
+                        Box(Modifier.background(Color.White.copy(.12f), CircleShape).padding(4.dp, 2.dp)) {
                             Row {
                                 ControlIconButton(Icons.Default.ThumbUp, "Like")
                                 ControlIconButton(Icons.Default.ThumbDown, "Dislike")
@@ -336,7 +326,7 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
                             }
                         }
                         Spacer(Modifier.width(12.dp))
-                        Box(Modifier.background(Color.White.copy(.12f), CircleShape).padding(horizontal = 4.dp, vertical = 2.dp)) {
+                        Box(Modifier.background(Color.White.copy(.12f), CircleShape).padding(4.dp, 2.dp)) {
                             Row { ControlIconButton(Icons.Default.ClosedCaption, "CC"); ControlIconButton(Icons.Default.Settings, "Settings") }
                         }
                     }
@@ -352,16 +342,16 @@ fun ControlChip(text: String) {
     Surface(onClick = {}, shape = ClickableSurfaceDefaults.shape(CircleShape), scale = ClickableSurfaceDefaults.scale(1f),
         colors = ClickableSurfaceDefaults.colors(Color.White.copy(.15f), Color.White, focusedContainerColor = Color.White, focusedContentColor = Color.Black),
         modifier = Modifier.padding(end = 4.dp)) {
-        Text(text, Modifier.padding(horizontal = 18.dp, vertical = 10.dp), style = MaterialTheme.typography.labelLarge)
+        Text(text, Modifier.padding(18.dp, 10.dp), style = MaterialTheme.typography.labelLarge)
     }
 }
 
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-fun ControlIconButton(icon: ImageVector, contentDescription: String) {
+fun ControlIconButton(icon: ImageVector, cd: String) {
     Surface(onClick = {}, shape = ClickableSurfaceDefaults.shape(CircleShape), scale = ClickableSurfaceDefaults.scale(1f),
         colors = ClickableSurfaceDefaults.colors(Color.Transparent, Color.White, focusedContainerColor = Color.White, focusedContentColor = Color.Black),
         modifier = Modifier.size(46.dp)) {
-        Box(Modifier.fillMaxSize(), Alignment.Center) { Icon(icon, contentDescription, Modifier.size(24.dp)) }
+        Box(Modifier.fillMaxSize(), Alignment.Center) { Icon(icon, cd, Modifier.size(24.dp)) }
     }
 }
