@@ -36,6 +36,12 @@ android {
     buildFeatures {
         compose = true
     }
+    // Required for Android 9 compatibility: use legacy JNI lib packaging
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {
