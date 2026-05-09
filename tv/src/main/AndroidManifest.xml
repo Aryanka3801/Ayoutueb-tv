@@ -20,7 +20,6 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Ayoutube"
         android:usesCleartextTraffic="true"
-        android:extractNativeLibs="true"
         android:networkSecurityConfig="@xml/network_security_config">
 
         <!-- Required for Android 9 (API 28): Apache HTTP client was removed -->
