@@ -49,11 +49,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.ui.PlayerView
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
@@ -69,12 +71,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.stream.StreamInfo
+import java.util.Locale
 
 class VideoPlayerActivity : ComponentActivity() {
 
     var player: ExoPlayer? = null
 
-    // Use explicit state holders — safer across Android versions
     val showControls = mutableStateOf(true)
     val isPlaying = mutableStateOf(false)
     val isLoading = mutableStateOf(true)
@@ -106,7 +108,7 @@ class VideoPlayerActivity : ComponentActivity() {
         val videoUrl = intent.getStringExtra(EXTRA_URL) ?: ""
         val videoTitle = intent.getStringExtra(EXTRA_TITLE) ?: ""
 
-        // Build ExoPlayer with explicit Looper for Android 9 compatibility
+        // Explicit Looper required for Android 9 stability
         player = ExoPlayer.Builder(this)
             .setLooper(Looper.getMainLooper())
             .build()
@@ -114,6 +116,22 @@ class VideoPlayerActivity : ComponentActivity() {
         player?.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 isPlaying.value = playing
+            }
+
+            // Catch ExoPlayer errors on Android 9 instead of crashing
+            override fun onPlayerError(error: PlaybackException) {
+                error.printStackTrace()
+                hasError.value = true
+                isLoading.value = false
+            }
+
+            // Update loading state when player is actually ready
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) {
+                    isLoading.value = false
+                } else if (playbackState == Player.STATE_BUFFERING) {
+                    isLoading.value = true
+                }
             }
         })
 
@@ -158,17 +176,25 @@ class VideoPlayerActivity : ComponentActivity() {
                         .maxByOrNull { it.averageBitrate }
 
                     withContext(Dispatchers.Main) {
+                        // HTTP factory with User-Agent and increased timeouts for Android 9
+                        val httpFactory = DefaultHttpDataSource.Factory()
+                            .setConnectTimeoutMs(30000)
+                            .setReadTimeoutMs(30000)
+                            .setAllowCrossProtocolRedirects(true)
+                            .setDefaultRequestProperties(
+                                mapOf(
+                                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                                )
+                            )
+
+                        // Explicit extractor factory avoids codec detection issues on Android 9
+                        val extractorsFactory = DefaultExtractorsFactory()
+
                         val videoStreamUrl = muxedStream?.content ?: videoOnlyStream?.content
                         if (videoStreamUrl != null && audioStream != null && muxedStream == null) {
-                            // Build HTTP factory with increased timeouts for Android 9
-                            val httpFactory = DefaultHttpDataSource.Factory()
-                                .setConnectTimeoutMs(30000)
-                                .setReadTimeoutMs(30000)
-                                .setAllowCrossProtocolRedirects(true)
-
-                            val videoSource = ProgressiveMediaSource.Factory(httpFactory)
+                            val videoSource = ProgressiveMediaSource.Factory(httpFactory, extractorsFactory)
                                 .createMediaSource(MediaItem.fromUri(videoStreamUrl))
-                            val audioSource = ProgressiveMediaSource.Factory(httpFactory)
+                            val audioSource = ProgressiveMediaSource.Factory(httpFactory, extractorsFactory)
                                 .createMediaSource(MediaItem.fromUri(audioStream.content))
                             val mergedSource = MergingMediaSource(videoSource, audioSource)
                             player?.setMediaSource(mergedSource)
@@ -183,7 +209,6 @@ class VideoPlayerActivity : ComponentActivity() {
                         }
                         player?.prepare()
                         player?.playWhenReady = true
-                        isLoading.value = false
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
@@ -263,15 +288,16 @@ class VideoPlayerActivity : ComponentActivity() {
     }
 }
 
+// Locale.US prevents crashes on Arabic/Persian/other locales on Android 9
 fun formatTime(ms: Long): String {
     val totalSec = ms / 1000
     val hours = totalSec / 3600
     val mins = (totalSec % 3600) / 60
     val secs = totalSec % 60
     return if (hours > 0) {
-        String.format("%d:%02d:%02d", hours, mins, secs)
+        String.format(Locale.US, "%d:%02d:%02d", hours, mins, secs)
     } else {
-        String.format("%d:%02d", mins, secs)
+        String.format(Locale.US, "%d:%02d", mins, secs)
     }
 }
 
@@ -299,7 +325,6 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
             .fillMaxSize()
             .background(Color.Black)
     ) {
-
         AndroidView(
             factory = { ctx ->
                 PlayerView(ctx).apply {
@@ -527,7 +552,7 @@ fun VideoPlayerScreen(activity: VideoPlayerActivity, title: String) {
 @Composable
 fun ControlChip(text: String) {
     Surface(
-        onClick = { /* Handle click */ },
+        onClick = { },
         shape = ClickableSurfaceDefaults.shape(CircleShape),
         scale = ClickableSurfaceDefaults.scale(focusedScale = 1f),
         colors = ClickableSurfaceDefaults.colors(
@@ -550,7 +575,7 @@ fun ControlChip(text: String) {
 @Composable
 fun ControlIconButton(icon: ImageVector, contentDescription: String) {
     Surface(
-        onClick = { /* Handle click */ },
+        onClick = { },
         shape = ClickableSurfaceDefaults.shape(CircleShape),
         scale = ClickableSurfaceDefaults.scale(focusedScale = 1f),
         colors = ClickableSurfaceDefaults.colors(
